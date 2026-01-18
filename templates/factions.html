@@ -30,7 +30,7 @@
     </div>
     {% for f in live_top_5 %}
     <div class="col-md-2 mb-2">
-        <a href="/?faction={{ f.operator_name|urlencode }}" class="text-decoration-none">
+        <a href="/faction/{{ f.operator_name|urlencode }}" class="text-decoration-none">
             <div class="card bg-dark border-success text-white text-center h-100 shadow-sm faction-card-hover">
                 <div class="card-body p-2">
                     <div class="h6 text-success text-truncate mb-1" title="{{ f.operator_name }}">
@@ -95,7 +95,7 @@
                             {% for row in month_data %}
                             <tr>
                                 <td class="ps-4">
-                                    <a href="/?faction={{ row.operator_name|urlencode }}" class="text-info fw-bold text-decoration-none">
+                                    <a href="/faction/{{ row.operator_name|urlencode }}" class="text-info fw-bold text-decoration-none">
                                         {{ row.operator_name }}
                                     </a>
                                 </td>

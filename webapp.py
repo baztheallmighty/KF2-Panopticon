@@ -16,7 +16,7 @@ DB_FILE = r"C:\apps\Webapp\kf2_panopticon_v3_star.db"
 PER_PAGE = 50
 
 # Set a Secret Key for Sessions
-app.secret_key = os.environ.get('SECRET_KEY', 'CHasdfasdfasdfaw4ezxcvgxhccycxvgSH_12345') 
+app.secret_key = os.environ.get('SECRET_KEY', 'xxxxxx') 
 
 # --- LOGGING SETUP ---
 perf_logger = logging.getLogger('performance')
@@ -74,7 +74,7 @@ def log_performance(exception=None):
             "breakdown": getattr(g, 'perf_steps', [])
         }
         
-        threading.Thread(target=write_log_background, args=(log_entry,)).start()
+        write_log_background(log_entry)
 
 # --- MEMORY CACHE SYSTEM ---
 class DataCache:
@@ -98,7 +98,7 @@ cache = DataCache()
 def get_db():
     db = getattr(g, '_database', None)
     if db is None:
-        db = g._database = sqlite3.connect(DB_FILE)
+        db = g._database = sqlite3.connect(f"file:{DB_FILE}?mode=ro",uri=True,  check_same_thread=False)
         db.row_factory = sqlite3.Row
     return db
 
@@ -169,134 +169,209 @@ def get_global_stats(cur):
 def servers():
     cur = get_db().cursor()
     stats = get_global_stats(cur)
-    
-    # --- UNRESTRICTED VIEW ---
+
     target_faction = request.args.get('faction')
-    
-    # Updated to fetch 'location' directly
+
     base_query = """
         SELECT 
-            s.id, s.ip_address, s.query_port, s.game_port, s.name, 
-            s.player_count, s.last_seen, s.operator_name, s.location,
-            m.name as map
+            s.id,
+            s.ip_address,
+            s.query_port,
+            s.game_port,
+            s.name,
+            s.player_count,
+            s.last_seen,
+            s.operator_name,
+            s.location,
+            m.name AS map
         FROM dim_servers s
-        LEFT JOIN dim_maps m ON s.current_map_id = m.id
+        LEFT JOIN dim_maps m
+            ON s.current_map_id = m.id
+        LEFT JOIN server_visibility sv
+            ON sv.server_id = s.id AND sv.hidden = 1
+        WHERE sv.server_id IS NULL
     """
-    
+
     params = []
+
     if target_faction:
-        base_query += " WHERE s.operator_name = ?"
+        base_query += " AND s.operator_name = ?"
         params.append(target_faction)
-        
+
     base_query += " ORDER BY s.player_count DESC"
-    
+
     with StepTimer("Servers List Query"):
         server_rows = cur.execute(base_query, params).fetchall()
-    
+
     with StepTimer("Process/Geo Resolution"):
         servers_list = []
         for row in server_rows:
             s = dict(row)
+
             if s['game_port'] and s['game_port'] > 0:
                 s['display_addr'] = f"{s['ip_address']}:{s['game_port']}"
                 s['is_fallback'] = False
             else:
                 s['display_addr'] = f"{s['ip_address']}:{s['query_port']}"
                 s['is_fallback'] = True
-                
-            # FAST PARSE - NO DB LOOKUP
-            geo = parse_location(s.get('location')) 
+
+            geo = parse_location(s.get('location'))
             s['flag'] = geo['flag']
             s['city'] = geo['city']
+
             servers_list.append(s)
 
     with StepTimer("Render Template"):
-        return render_template('servers.html', servers=servers_list, stats=stats, current_faction=target_faction)
-    
+        return render_template(
+            'servers.html',
+            servers=servers_list,
+            stats=stats,
+            current_faction=target_faction
+        )
+
 @app.route('/factions')
 def factions():
     db = get_db()
-    stats = get_global_stats(db.cursor())
+    cur = db.cursor()
+    stats = get_global_stats(cur)
 
-    # --- CACHED SECTION START ---
-    with StepTimer("Check Cache"):
-        cached_data = cache.get('factions_page')
-    
+    cache_key = 'factions_page'
+
+    cached_data = cache.get(cache_key)
     if cached_data:
         live_top_5, month_rows, all_time_rows, chart_data = cached_data
-        with StepTimer("Cache Hit Processing"):
-            pass 
     else:
-        # 1. LIVE TOP 5 (Fast)
-        with StepTimer("Query: Live Top 5"):
-            live_top_5 = db.execute("""
-                SELECT 
-                    operator_name,
-                    SUM(player_count) as current_players,
-                    COUNT(id) as active_servers
-                FROM dim_servers
-                WHERE operator_name IS NOT NULL 
-                  AND operator_name != 'Unknown' 
-                  AND player_count > 0
-                GROUP BY operator_name
-                ORDER BY current_players DESC
-                LIMIT 6
-            """).fetchall()
+        # ------------------------------------------------------------
+        # 1. LIVE TOP 5 (VISIBLE SERVERS ONLY)
+        # ------------------------------------------------------------
+        live_top_5 = cur.execute("""
+            SELECT 
+                s.operator_name,
+                SUM(s.player_count) AS current_players,
+                COUNT(s.id) AS active_servers
+            FROM dim_servers s
+            LEFT JOIN server_visibility sv
+                ON sv.server_id = s.id AND sv.hidden = 1
+            WHERE sv.server_id IS NULL
+              AND s.operator_name IS NOT NULL
+              AND s.operator_name != 'Unknown'
+              AND s.player_count > 0
+            GROUP BY s.operator_name
+            ORDER BY current_players DESC
+            LIMIT 6
+        """).fetchall()
 
-        # 2. LAST 30 DAYS (Heavy) - UPDATED to use calculated_duration
-        with StepTimer("Query: Last 30 Days (HEAVY)"):
-            month_rows = db.execute("""
+        # ------------------------------------------------------------
+        # 2. LAST 30 DAYS (ONLY FACTIONS WITH VISIBLE SERVERS)
+        # ------------------------------------------------------------
+        month_rows = cur.execute("""
+            WITH visible_servers AS (
+                SELECT DISTINCT operator_name
+                FROM dim_servers s
+                LEFT JOIN server_visibility sv
+                    ON sv.server_id = s.id AND sv.hidden = 1
+                WHERE sv.server_id IS NULL
+            ),
+            servers_30d AS (
                 SELECT
                     operator_name,
-                    SUM(server_count) AS server_count,
-                    SUM(unique_players) AS unique_players,
+                    MAX(server_count) AS server_count,
                     SUM(total_playtime_seconds) AS total_playtime_seconds,
                     MAX(last_contact) AS last_contact
                 FROM fact_operator_daily
                 WHERE day >= date('now', '-30 days')
                 GROUP BY operator_name
-                ORDER BY unique_players DESC;
-            """).fetchall()
-
-        # 3. ALL TIME (Very Heavy) - UPDATED to use calculated_duration
-        with StepTimer("Query: All Time (HEAVY)"):
-            all_time_rows = db.execute("""
+            ),
+            players_30d AS (
                 SELECT
                     operator_name,
-                    SUM(unique_players) AS unique_players,
+                    COUNT(DISTINCT player_id) AS unique_players
+                FROM fact_operator_player_daily
+                JOIN dim_players p ON fact_operator_player_daily.player_id = p.id  
+                WHERE day >= date('now', '-30 days')
+                  AND p.name NOT LIKE '[UNNAMED:%'                                 
+                GROUP BY operator_name
+            )
+            SELECT
+                s.operator_name,
+                s.server_count,
+                p.unique_players,
+                s.total_playtime_seconds,
+                s.last_contact
+            FROM servers_30d s
+            JOIN players_30d p USING (operator_name)
+            JOIN visible_servers v USING (operator_name)
+            ORDER BY p.unique_players DESC
+        """).fetchall()
+
+        # ------------------------------------------------------------
+        # 3. ALL TIME (VISIBLE FACTIONS ONLY)
+        # ------------------------------------------------------------
+        all_time_rows = cur.execute("""
+            WITH visible_servers AS (
+                SELECT DISTINCT operator_name
+                FROM dim_servers s
+                LEFT JOIN server_visibility sv
+                    ON sv.server_id = s.id AND sv.hidden = 1
+                WHERE sv.server_id IS NULL
+            ),
+            players_all_time AS (
+                SELECT
+                    operator_name,
+                    COUNT(DISTINCT player_id) AS unique_players
+                FROM fact_operator_player_daily
+                JOIN dim_players p ON fact_operator_player_daily.player_id = p.id  
+                WHERE p.name NOT LIKE '[UNNAMED:%'                                 
+                GROUP BY operator_name
+            ),
+            playtime_all_time AS (
+                SELECT
+                    operator_name,
                     SUM(total_playtime_seconds) AS total_playtime_seconds
                 FROM fact_operator_daily
                 GROUP BY operator_name
-                ORDER BY total_playtime_seconds DESC
-                LIMIT 50;
+            )
+            SELECT
+                p.operator_name,
+                p.unique_players,
+                t.total_playtime_seconds
+            FROM players_all_time p
+            JOIN playtime_all_time t USING (operator_name)
+            JOIN visible_servers v USING (operator_name)
+            ORDER BY t.total_playtime_seconds DESC
+            LIMIT 50
+        """).fetchall()
 
-            """).fetchall()
+        # ------------------------------------------------------------
+        # 4. SHAPING
+        # ------------------------------------------------------------
+        live_top_5 = [dict(r) for r in live_top_5]
+        month_rows = [dict(r) for r in month_rows]
+        all_time_rows = [dict(r) for r in all_time_rows]
 
-        with StepTimer("Data Processing"):
-            # Convert Row objects to dicts so they can be cached safely
-            live_top_5 = [dict(r) for r in live_top_5]
-            month_rows = [dict(r) for r in month_rows]
-            all_time_rows = [dict(r) for r in all_time_rows]
+        top_10_month = month_rows[:10]
+        chart_data = {
+            'labels': [r['operator_name'] for r in top_10_month],
+            'players': [r['unique_players'] for r in top_10_month],
+            'hours': [
+                round(r['total_playtime_seconds'] / 3600)
+                if r['total_playtime_seconds'] else 0
+                for r in top_10_month
+            ]
+        }
 
-            # Prepare Chart Data
-            top_10_month = month_rows[:10]
-            chart_data = {
-                'labels': [r['operator_name'] for r in top_10_month],
-                'players': [r['unique_players'] for r in top_10_month],
-                'hours': [round(r['total_playtime_seconds'] / 3600) if r['total_playtime_seconds'] else 0 for r in top_10_month]
-            }
-        
-        cache.set('factions_page', (live_top_5, month_rows, all_time_rows, chart_data))
-    # --- CACHED SECTION END ---
+        cache.set(cache_key, (live_top_5, month_rows, all_time_rows, chart_data))
 
-    with StepTimer("Render Template"):
-        return render_template('factions.html', 
-                               stats=stats,
-                               live_top_5=live_top_5,
-                               month_data=month_rows,
-                               all_time_data=all_time_rows,
-                               chart_data=chart_data)
-                            
+    return render_template(
+        'factions.html',
+        stats=stats,
+        live_top_5=live_top_5,
+        month_data=month_rows,
+        all_time_data=all_time_rows,
+        chart_data=chart_data
+    )
+
+                 
 @app.route('/players')
 def players():
     cur = get_db().cursor()
@@ -308,7 +383,10 @@ def players():
         players_rows = cur.execute("""
             SELECT 
                 dp.id as player_id,
-                dp.name as player_name, 
+                CASE
+                    WHEN pv.player_id IS NOT NULL THEN '[Hidden]'
+                    ELSE dp.name
+                END AS player_name,
                 fa.score, 
                 fa.calculated_duration as duration,
                 fa.last_seen, 
@@ -323,6 +401,9 @@ def players():
             JOIN dim_players dp ON fa.player_id = dp.id
             JOIN dim_servers ds ON fa.server_id = ds.id
             LEFT JOIN dim_maps dm ON fa.map_id = dm.id
+            LEFT JOIN player_visibility pv
+                ON pv.player_id = dp.id AND pv.hidden = 1
+            WHERE dp.name NOT LIKE '[UNNAMED:%'
             ORDER BY fa.score DESC
         """).fetchall()
 
@@ -375,10 +456,20 @@ def get_match_history(db, server_id, page, per_page):
         placeholders = ','.join(['?'] * len(uuids))
         
         roster_rows = db.execute(f"""
-            SELECT h.session_uuid, p.id as player_id, p.name, h.final_score, h.total_time
+            SELECT
+                h.session_uuid,
+                p.id as player_id,
+                CASE
+                    WHEN pv.player_id IS NOT NULL THEN '[Hidden]'
+                    ELSE p.name
+                END AS name,
+                h.final_score,
+                h.calculated_duration as total_time
             FROM fact_history h
             JOIN dim_players p ON h.player_id = p.id
-            WHERE h.session_uuid IN ({placeholders})
+            LEFT JOIN player_visibility pv
+                ON pv.player_id = p.id AND pv.hidden = 1
+            WHERE h.session_uuid IN ({placeholders}) AND p.name NOT LIKE '[UNNAMED:%'
             ORDER BY h.final_score DESC
         """, uuids).fetchall()
         
@@ -400,29 +491,46 @@ def get_match_history(db, server_id, page, per_page):
 def server_detail(server_id):
     db = get_db()
     page = request.args.get('page', 1, type=int)
-    
+
     with StepTimer("Server Info Query"):
-        # Updated to fetch location
-        server = db.execute("SELECT * FROM dim_servers WHERE id = ?", (server_id,)).fetchone()
-        if not server: return "Server not found.", 404
+        server = db.execute("""
+            SELECT s.*
+            FROM dim_servers s
+            LEFT JOIN server_visibility sv
+                ON sv.server_id = s.id AND sv.hidden = 1
+            WHERE s.id = ?
+              AND sv.server_id IS NULL
+        """, (server_id,)).fetchone()
+
+        if not server:
+            return "Server not found.", 404
+
         s_dict = dict(server)
 
         if s_dict['game_port'] and s_dict['game_port'] > 0:
             s_dict['display_addr'] = f"{s_dict['ip_address']}:{s_dict['game_port']}"
         else:
             s_dict['display_addr'] = f"{s_dict['ip_address']}:{s_dict['query_port']}"
-            
-        # Parse location for the template
+
         geo = parse_location(s_dict.get('location'))
         s_dict['flag'] = geo['flag']
         s_dict['city'] = geo['city']
 
     with StepTimer("Active Players Query"):
-        # UPDATED: Use calculated_duration
         active_players = db.execute("""
-            SELECT p.id as player_id, p.name, a.score, a.calculated_duration as duration, a.first_seen
+            SELECT
+                p.id as player_id,
+                CASE
+                    WHEN pv.player_id IS NOT NULL THEN '[Hidden]'
+                    ELSE p.name
+                END AS name,
+                a.score,
+                a.calculated_duration as duration,
+                a.first_seen
             FROM fact_active a
             JOIN dim_players p ON a.player_id = p.id
+            LEFT JOIN player_visibility pv
+                ON pv.player_id = p.id AND pv.hidden = 1
             WHERE a.server_id = ?
             ORDER BY a.score DESC
         """, (server_id,)).fetchall()
@@ -431,7 +539,6 @@ def server_detail(server_id):
     pagination = get_pagination(total_count, page, 15)
 
     with StepTimer("Map Stats Query"):
-        # UPDATED: Use calculated_duration from fact_server_history
         map_rows = db.execute("""
             SELECT m.name, COUNT(h.id) as count
             FROM fact_server_history h
@@ -441,7 +548,7 @@ def server_detail(server_id):
             ORDER BY count DESC
             LIMIT 5
         """, (server_id,)).fetchall()
-    
+
     chart_map_labels = [row['name'] for row in map_rows]
     chart_map_data = [row['count'] for row in map_rows]
 
@@ -449,23 +556,27 @@ def server_detail(server_id):
         traffic_rows = db.execute("""
             SELECT strftime('%H', session_start) as hour, COUNT(*) as count
             FROM fact_history
-            WHERE server_id = ? AND session_start > date('now', '-30 days')
+            WHERE server_id = ?
+              AND session_start > date('now', '-30 days')
             GROUP BY hour
             ORDER BY hour ASC
         """, (server_id,)).fetchall()
-        
+
         traffic_dict = {int(row['hour']): row['count'] for row in traffic_rows}
         chart_traffic_data = [traffic_dict.get(h, 0) for h in range(24)]
 
     with StepTimer("Render Template"):
-        return render_template('server_detail.html', 
-                               server=s_dict, 
-                               active_players=active_players, 
-                               matches=matches,
-                               pagination=pagination,
-                               chart_map_labels=chart_map_labels,
-                               chart_map_data=chart_map_data,
-                               chart_traffic_data=chart_traffic_data)
+        return render_template(
+            'server_detail.html',
+            server=s_dict,
+            active_players=active_players,
+            matches=matches,
+            pagination=pagination,
+            chart_map_labels=chart_map_labels,
+            chart_map_data=chart_map_data,
+            chart_traffic_data=chart_traffic_data
+        )
+
 
 @app.route('/player/<int:player_id>')
 def player_detail(player_id):
@@ -474,19 +585,98 @@ def player_detail(player_id):
     offset = (page - 1) * PER_PAGE
 
     with StepTimer("Player Info Query"):
-        player = db.execute("SELECT * FROM dim_players WHERE id = ?", (player_id,)).fetchone()
-        if not player: return "Player not found.", 404
+        player = db.execute("""
+            SELECT p.*, pv.player_id AS hidden
+            FROM dim_players p
+            LEFT JOIN player_visibility pv
+                ON pv.player_id = p.id AND pv.hidden = 1
+            WHERE p.id = ?
+        """, (player_id,)).fetchone()
+
+        if not player or player['hidden']:
+            return "Player not found.", 404
 
         count = db.execute("SELECT COUNT(*) FROM fact_history WHERE player_id = ?", (player_id,)).fetchone()[0]
     
+    # --- NEW: Live Status Check ---
+    with StepTimer("Live Status Check"):
+        live_status = db.execute("""
+            SELECT 
+                s.id as server_id,
+                s.name as server_name,
+                s.ip_address, s.query_port, s.game_port,
+                m.name as map_name,
+                fa.score,
+                fa.calculated_duration as current_duration,
+                fa.first_seen as session_start
+            FROM fact_active fa
+            JOIN dim_servers s ON fa.server_id = s.id
+            LEFT JOIN dim_maps m ON fa.map_id = m.id
+            WHERE fa.player_id = ?
+        """, (player_id,)).fetchone()
+
+        live_data = None
+        if live_status:
+            live_data = dict(live_status)
+            # JOIN LINK ADDRESS: ALWAYS use Query Port (Steam Protocol Requirement)
+            # This fixes the "Invalid App ID" error by letting Steam query the server first.
+            live_data['join_address'] = f"{live_data['ip_address']}:{live_data['query_port']}?appid=232090"
+            
+    # --- NEW: Career KPIs & Behavior ---
+    with StepTimer("Player Stats Query"):
+        # 1. Aggregates (Time, Efficiency)
+        stats_row = db.execute("""
+            SELECT 
+                SUM(calculated_duration) as total_time,
+                AVG(calculated_duration) as avg_session,
+                SUM(final_score) as total_score
+            FROM fact_history 
+            WHERE player_id = ?
+        """, (player_id,)).fetchone()
+        
+        player_stats = {
+            "total_time": stats_row['total_time'] or 0,
+            "avg_session": stats_row['avg_session'] or 0,
+            "spm": 0 # Score Per Minute
+        }
+        
+        if player_stats["total_time"] > 0:
+            total_minutes = player_stats["total_time"] / 60
+            player_stats["spm"] = int((stats_row['total_score'] or 0) / total_minutes)
+
+        # 2. Favorite Map
+        fav_map = db.execute("""
+            SELECT m.name 
+            FROM fact_history h
+            JOIN dim_maps m ON h.map_id = m.id
+            WHERE h.player_id = ? 
+            GROUP BY h.map_id 
+            ORDER BY COUNT(*) DESC LIMIT 1
+        """, (player_id,)).fetchone()
+        player_stats["fav_map"] = fav_map['name'] if fav_map else "Unknown"
+
+        # 3. Prime Time (Hour of day)
+        prime_time = db.execute("""
+            SELECT strftime('%H', session_start) as hour 
+            FROM fact_history 
+            WHERE player_id = ? 
+            GROUP BY hour 
+            ORDER BY COUNT(*) DESC LIMIT 1
+        """, (player_id,)).fetchone()
+        
+        if prime_time:
+            h = int(prime_time['hour'])
+            player_stats["prime_time"] = f"{h:02d}:00 - {h+1:02d}:00"
+        else:
+            player_stats["prime_time"] = "N/A"
+
     with StepTimer("Player History Query"):
-        # Updated to fetch location
         history_rows = db.execute("""
             SELECT 
                 s.id as server_id, 
                 s.name as server_name, 
                 h.session_start, 
-                h.total_time, 
+                h.calculated_duration as total_time, 
                 h.final_score, 
                 s.ip_address,
                 s.game_port,
@@ -507,7 +697,6 @@ def player_detail(player_id):
         else:
             h['address'] = f"{h['ip_address']}:{h['query_port']}"
         
-        # Parse location
         geo = parse_location(h.get('location'))
         h['flag'] = geo['flag']
         h['city'] = geo['city']
@@ -516,23 +705,30 @@ def player_detail(player_id):
     with StepTimer("Teammates Query"):
         teammates = db.execute("""
             SELECT 
-                p2.id,
-                p2.name,
-                COUNT(DISTINCT h1.session_uuid) as matches_together,
-                SUM(h2.total_time) as total_time_together
-            FROM fact_history h1
-            JOIN fact_history h2 ON h1.session_uuid = h2.session_uuid
-            JOIN dim_players p2 ON h2.player_id = p2.id
-            WHERE h1.player_id = ?      
-              AND h2.player_id != ?     
-              AND h1.session_uuid IS NOT NULL
-            GROUP BY p2.id
-            ORDER BY matches_together DESC
-            LIMIT 20
+            p2.id,
+            p2.name,
+            COUNT(DISTINCT h1.session_uuid) AS matches_together,
+            SUM(h2.calculated_duration) AS total_time_together,
+            CASE 
+                WHEN fa.player_id IS NOT NULL THEN 1
+                ELSE 0
+            END AS is_online
+        FROM fact_history h1
+        JOIN fact_history h2 
+            ON h1.session_uuid = h2.session_uuid
+        JOIN dim_players p2 
+            ON h2.player_id = p2.id
+        LEFT JOIN fact_active fa
+            ON fa.player_id = p2.id
+        WHERE h1.player_id = ?      
+          AND h2.player_id != ?     
+          AND h1.session_uuid IS NOT NULL
+        GROUP BY p2.id
+        ORDER BY is_online DESC, matches_together DESC
+        LIMIT 30;
         """, (player_id, player_id)).fetchall()
 
     with StepTimer("Allegiances Query"):
-        # UPDATED: Use h.calculated_duration
         allegiances = db.execute("""
             SELECT 
                 s.operator_name,
@@ -555,7 +751,9 @@ def player_detail(player_id):
                                history=history, 
                                teammates=teammates,
                                allegiances=allegiances,
-                               pagination=pagination)
+                               pagination=pagination,
+                               live_data=live_data,    # <--- Passed here
+                               stats=player_stats)     # <--- Passed here
 
 @app.route('/search')
 def global_search():
@@ -568,15 +766,24 @@ def global_search():
         wildcard_q = f"%{q}%"
 
         players = db.execute("""
-            SELECT id, name FROM dim_players WHERE name LIKE ? ORDER BY length(name) ASC LIMIT 50
+            SELECT p.id, p.name
+            FROM dim_players p
+            LEFT JOIN player_visibility pv
+                ON pv.player_id = p.id AND pv.hidden = 1
+            WHERE p.name LIKE ?
+              AND pv.player_id IS NULL
+            ORDER BY length(p.name) ASC
+            LIMIT 50
         """, (wildcard_q,)).fetchall()
 
         # Updated to fetch location
         server_rows = db.execute("""
             SELECT id, name, ip_address, game_port, query_port, last_seen, location
-            FROM dim_servers 
-            WHERE name LIKE ? OR (ip_address || ':' || game_port) LIKE ? 
-            ORDER BY last_seen DESC LIMIT 50
+            FROM dim_servers s
+            LEFT JOIN server_visibility sv
+                ON sv.server_id = s.id AND sv.hidden = 1
+            WHERE sv.server_id IS NULL
+              AND (s.name LIKE ? OR (s.ip_address || ':' || s.game_port) LIKE ?)
         """, (wildcard_q, wildcard_q)).fetchall()
 
         servers = []
@@ -594,6 +801,175 @@ def global_search():
             servers.append(s)
 
         return render_template('search_results.html', query=q, players=players, servers=servers)
+        
+@app.route('/faction/<operator_name>')
+def faction_detail(operator_name):
+    db = get_db()
+    cur = db.cursor()
+    stats = get_global_stats(cur)
+
+    # ------------------------------------------------------------
+    # HARD GATE: faction must have at least ONE visible server
+    # ------------------------------------------------------------
+    visible_server_exists = cur.execute("""
+        SELECT 1
+        FROM dim_servers s
+        LEFT JOIN server_visibility sv
+            ON sv.server_id = s.id AND sv.hidden = 1
+        WHERE s.operator_name = ?
+          AND sv.server_id IS NULL
+        LIMIT 1
+    """, (operator_name,)).fetchone()
+
+    if not visible_server_exists:
+        return "Faction not found.", 404
+
+    cache_key = f"faction:{operator_name}"
+
+    cached = cache.get(cache_key)
+    if cached:
+        summary, servers, history, regulars = cached
+    else:
+        # ------------------------------------------------------------
+        # 1. FACTION SUMMARY (30 DAYS, ROLLUP SAFE)
+        # ------------------------------------------------------------
+        row = cur.execute("""
+            SELECT
+                operator_name,
+                MAX(server_count) AS servers_30d,
+                SUM(total_playtime_seconds) AS playtime_30d,
+                MAX(last_contact) AS last_contact
+            FROM fact_operator_daily
+            WHERE operator_name = ?
+              AND day >= date('now', '-30 days')
+            GROUP BY operator_name
+        """, (operator_name,)).fetchone()
+
+        if not row:
+            return "Faction not found.", 404
+
+        summary = dict(row)
+
+        # ------------------------------------------------------------
+        # 1.5 TRUE UNIQUE PLAYERS (30 DAYS)
+        # ------------------------------------------------------------
+        summary["players_30d"] = cur.execute("""
+            SELECT COUNT(DISTINCT player_id)
+            FROM fact_operator_player_daily
+            JOIN dim_players p ON fact_operator_player_daily.player_id = p.id
+            WHERE operator_name = ?
+              AND day >= date('now', '-30 days')
+              AND p.name NOT LIKE '[UNNAMED:%'
+        """, (operator_name,)).fetchone()[0]
+
+        # ------------------------------------------------------------
+        # 2. SERVER LIST (VISIBLE ONLY)
+        # ------------------------------------------------------------
+        server_rows = cur.execute("""
+            SELECT
+                s.id,
+                s.name,
+                s.ip_address,
+                s.query_port,
+                s.game_port,
+                s.player_count,
+                s.last_seen,
+                s.location
+            FROM dim_servers s
+            LEFT JOIN server_visibility sv
+                ON sv.server_id = s.id AND sv.hidden = 1
+            WHERE s.operator_name = ?
+              AND sv.server_id IS NULL
+        """, (operator_name,)).fetchall()
+
+        servers = []
+        for row in server_rows:
+            s = dict(row)
+
+            if s['game_port'] and s['game_port'] > 0:
+                s['address'] = f"{s['ip_address']}:{s['game_port']}"
+            else:
+                s['address'] = f"{s['ip_address']}:{s['query_port']}"
+
+            geo = parse_location(s.get('location'))
+            s['flag'] = geo['flag']
+            s['city'] = geo['city']
+            servers.append(s)
+
+        # ------------------------------------------------------------
+        # 3. FACTION REGULARS (ALL TIME, VISIBLE SERVERS ONLY)
+        # ------------------------------------------------------------
+        regulars_rows = cur.execute("""
+            SELECT
+                p.id AS player_id,
+                CASE
+                    WHEN pv.player_id IS NOT NULL THEN '[Hidden]'
+                    ELSE p.name
+                END AS player_name,
+                SUM(h.calculated_duration) AS total_playtime_seconds,
+                COUNT(DISTINCT h.session_uuid) AS sessions
+            FROM fact_history h
+            JOIN dim_servers s ON s.id = h.server_id
+            JOIN dim_players p ON p.id = h.player_id
+            LEFT JOIN player_visibility pv
+                ON pv.player_id = p.id AND pv.hidden = 1
+            LEFT JOIN server_visibility sv
+                ON sv.server_id = s.id AND sv.hidden = 1
+            WHERE s.operator_name = ?
+              AND sv.server_id IS NULL
+              AND p.name NOT LIKE '[UNNAMED:%'
+            GROUP BY p.id
+            ORDER BY total_playtime_seconds DESC
+            LIMIT 50
+        """, (operator_name,)).fetchall()
+
+        regulars = [dict(r) for r in regulars_rows]
+
+        # ------------------------------------------------------------
+        # 4. FACTION HISTORY (ROLLUP)
+        # ------------------------------------------------------------
+        history_rows = cur.execute("""
+            SELECT
+                day,
+                unique_players,
+                server_count,
+                total_playtime_seconds
+            FROM fact_operator_daily
+            WHERE operator_name = ?
+            ORDER BY day ASC
+        """, (operator_name,)).fetchall()
+
+        history = {
+            "labels": [],
+            "players": [],
+            "servers": [],
+            "hours": []
+        }
+
+        for r in history_rows:
+            history["labels"].append(r["day"])
+            history["players"].append(r["unique_players"])
+            history["servers"].append(r["server_count"])
+            history["hours"].append(
+                round(r["total_playtime_seconds"] / 3600)
+                if r["total_playtime_seconds"] else 0
+            )
+
+        cache.set(cache_key, (summary, servers, history, regulars))
+
+    return render_template(
+        "faction_detail.html",
+        stats=stats,
+        faction=operator_name,
+        summary=summary,
+        servers=servers,
+        history=history,
+        regulars=regulars
+    )
+
+
+
+
 
 @app.route('/stats')
 def statistics():
@@ -643,12 +1019,17 @@ def statistics():
                     SUM(d.session_count) AS session_count,
                     SUM(d.total_seconds) AS total_seconds
                 FROM fact_server_daily d
-                JOIN dim_servers s ON d.server_id = s.id
-                WHERE d.day >= date('now', '-30 days')
+                JOIN dim_servers s
+                    ON d.server_id = s.id
+                LEFT JOIN server_visibility sv
+                    ON sv.server_id = s.id AND sv.hidden = 1
+                WHERE sv.server_id IS NULL
+                  AND d.day >= date('now', '-30 days')
                 GROUP BY d.server_id
                 ORDER BY total_seconds DESC
                 LIMIT 10;
             """).fetchall()
+
 
             server_stats = []
             for row in server_rows:
@@ -670,6 +1051,7 @@ def statistics():
                 FROM fact_player_daily d
                 JOIN dim_players p ON d.player_id = p.id
                 WHERE d.day >= date('now', '-30 days')
+                    AND p.name NOT LIKE '[UNNAMED:%'
                 GROUP BY d.player_id
                 ORDER BY total_seconds DESC
                 LIMIT 10;

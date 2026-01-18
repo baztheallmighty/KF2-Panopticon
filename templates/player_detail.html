@@ -3,31 +3,88 @@
 {% block title %}Player: {{ player.name }}{% endblock %}
 
 {% block content %}
+{% if live_data %}
+<div class="alert alert-success border-success d-flex align-items-center mb-4 shadow-sm" role="alert">
+    <div class="me-3">
+        <div class="spinner-grow text-success" style="width: 1.5rem; height: 1.5rem;" role="status">
+            <span class="visually-hidden">Live...</span>
+        </div>
+    </div>
+    <div class="flex-grow-1">
+        <h4 class="alert-heading mb-1 fw-bold">🟢 LIVE NOW: COMBAT IN PROGRESS</h4>
+        <div class="d-flex flex-wrap gap-3">
+            <span><strong>Server:</strong> <a href="/server/{{ live_data.server_id }}" class="alert-link">{{ live_data.server_name }}</a></span>
+            <span><strong>Map:</strong> {{ live_data.map_name }}</span>
+            <span><strong>Duration:</strong> {{ live_data.current_duration|human_time }}</span>
+            <span><strong>Current Score:</strong> {{ "{:,}".format(live_data.score) }}</span>
+        </div>
+    </div>
+    <div>
+        <a href="steam://connect/{{ live_data.join_address }}" class="btn btn-success btn-sm fw-bold">
+            <i class="bi bi-controller"></i> JOIN
+        </a>
+    </div>
+</div>
+{% endif %}
+
 <div class="alert alert-warning d-flex align-items-center mb-4" role="alert">
     <div class="flex-grow-1">
         <strong>⚠️ IDENTITY WARNING:</strong> Data is tracked by <u>Name Only</u>. 
         If this player changes their name, they become a new person. 
         If someone else uses this name, their stats are merged here. 
-        Don't ban people based on this.
     </div>
 </div>
 
 <div class="row mb-4">
     <div class="col-12">
         <div class="card bg-dark text-white border-secondary">
-            <div class="card-header border-secondary">
+            <div class="card-header border-secondary d-flex justify-content-between align-items-center">
                 <h3 class="mb-0">👤 Player Dossier</h3>
+                <a href="/" class="btn btn-outline-light btn-sm">← Back to Grid</a>
             </div>
             <div class="card-body">
-                <div class="row">
+                <div class="row align-items-center mb-4">
                     <div class="col-md-8">
-                        <h2 class="display-6 text-white">{{ player.name }}</h2>
-                        <span class="badge bg-secondary">ID: {{ player.id }}</span>
+                        <h2 class="display-5 text-white fw-bold mb-0">{{ player.name }}</h2>
+                        <span class="badge bg-secondary font-monospace">ID: {{ player.id }}</span>
                     </div>
                     <div class="col-md-4 text-end">
-                         <a href="/" class="btn btn-outline-light btn-sm">← Back to Grid</a>
+                        <div class="text-muted small">Total Recorded Playtime</div>
+                        <div class="display-6 text-info">{{ stats.total_time|human_time }}</div>
                     </div>
                 </div>
+
+                <div class="row g-3">
+                    <div class="col-6 col-md-3">
+                        <div class="p-3 border border-secondary rounded bg-secondary bg-opacity-10 text-center">
+                            <div class="text-muted small text-uppercase mb-1">Efficiency</div>
+                            <div class="h4 mb-0 text-warning">{{ "{:,}".format(stats.spm) }}</div>
+                            <div class="small text-muted">Score / Min</div>
+                        </div>
+                    </div>
+                    <div class="col-6 col-md-3">
+                        <div class="p-3 border border-secondary rounded bg-secondary bg-opacity-10 text-center">
+                            <div class="text-muted small text-uppercase mb-1">Avg Session</div>
+                            <div class="h4 mb-0 text-info">{{ stats.avg_session|human_time }}</div>
+                            <div class="small text-muted">Per Match</div>
+                        </div>
+                    </div>
+                    <div class="col-6 col-md-3">
+                        <div class="p-3 border border-secondary rounded bg-secondary bg-opacity-10 text-center">
+                            <div class="text-muted small text-uppercase mb-1">Favorite Map</div>
+                            <div class="h4 mb-0 text-success text-truncate">{{ stats.fav_map }}</div>
+                            <div class="small text-muted">Most Played</div>
+                        </div>
+                    </div>
+                    <div class="col-6 col-md-3">
+                        <div class="p-3 border border-secondary rounded bg-secondary bg-opacity-10 text-center">
+                            <div class="text-muted small text-uppercase mb-1">Prime Time</div>
+                            <div class="h4 mb-0 text-light">{{ stats.prime_time }}</div>
+                            <div class="small text-muted">UTC</div>
+                        </div>
+                    </div>
+                </div>
+
             </div>
         </div>
     </div>
@@ -71,8 +128,17 @@
                             {% for row in history %}
                             <tr>
                                 <td>
-                                    <a href="/server/{{ row.server_id }}" class="text-decoration-none text-white fw-bold">{{ row.server_name }}</a>
-                                    <div class="small text-muted font-monospace">{{ row.address }}</div>
+                                    <div class="d-flex align-items-center">
+                                        {% if row.flag != 'unknown' %}
+                                            <img src="https://flagcdn.com/20x15/{{ row.flag }}.png" class="me-2" title="{{ row.city }}" alt="{{ row.flag }}">
+                                        {% else %}
+                                            <span class="me-2 text-muted">🌐</span>
+                                        {% endif %}
+                                        <div>
+                                            <a href="/server/{{ row.server_id }}" class="text-decoration-none text-white fw-bold">{{ row.server_name }}</a>
+                                            <div class="small text-muted font-monospace">{{ row.address }}</div>
+                                        </div>
+                                    </div>
                                 </td>
                                 <td>
                                     <span class="local-time" data-time="{{ row.session_start }}" style="visibility: hidden;">
@@ -112,7 +178,13 @@
                 <div class="row">
                     {% for buddy in teammates %}
                     <div class="col-md-6 col-lg-4 mb-3">
-                        <div class="d-flex align-items-center p-2 border border-secondary rounded bg-secondary bg-opacity-10">
+                        <div class="d-flex align-items-center p-2 border rounded
+                            {% if buddy.is_online %}
+                                border-success bg-success bg-opacity-10
+                            {% else %}
+                                border-secondary bg-secondary bg-opacity-10
+                            {% endif %}
+                        ">
                             <div class="flex-grow-1 text-truncate">
                                 <a href="/player/{{ buddy.id }}" class="fw-bold text-info text-decoration-none">
                                     {{ buddy.name }}
@@ -122,7 +194,16 @@
                                 </div>
                             </div>
                             <div class="text-end ps-2">
-                                <span class="badge bg-primary rounded-pill" title="Matches Played Together">
+                                {% if buddy.is_online %}
+                                    <span class="badge bg-success rounded-pill d-block mb-1">
+                                        ● ONLINE
+                                    </span>
+                                {% else %}
+                                    <span class="badge bg-secondary rounded-pill d-block mb-1">
+                                        OFFLINE
+                                    </span>
+                                {% endif %}
+                                <span class="badge bg-primary rounded-pill">
                                     {{ buddy.matches_together }} Matches
                                 </span>
                             </div>
@@ -143,7 +224,7 @@
                         <div class="d-flex align-items-center p-3 border border-secondary rounded bg-dark">
                             <div class="flex-grow-1">
                                 <h5 class="mb-1 text-success">
-                                    <a href="/?faction={{ f.operator_name|urlencode }}" class="text-decoration-none text-success">
+                                    <a href="/faction/{{ f.operator_name|urlencode }}" class="text-decoration-none text-success">
                                         <i class="bi bi-flag-fill me-2"></i>{{ f.operator_name }}
                                     </a>
                                 </h5>

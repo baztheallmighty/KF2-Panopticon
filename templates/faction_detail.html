@@ -1,0 +1,234 @@
+{% extends "base.html" %}
+
+{% block title %}Faction · {{ faction }}{% endblock %}
+
+{% block content %}
+<div class="row mb-4">
+    <div class="col-12">
+        <h2 class="text-white border-bottom border-secondary pb-2">
+            🏴 {{ faction }}
+        </h2>
+        <small class="text-muted">
+            Last contact:
+            <span class="local-time" data-time="{{ summary.last_contact }}">
+                {{ summary.last_contact }}
+            </span>
+        </small>
+    </div>
+</div>
+
+<!-- SUMMARY CARDS -->
+<div class="row mb-4 text-center">
+    <div class="col-md-3 mb-2">
+        <div class="card border-info">
+            <div class="card-body">
+                <div class="h6 text-info">Servers (30d)</div>
+                <div class="display-6 fw-bold">{{ summary.servers_30d }}</div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3 mb-2">
+        <div class="card border-success">
+            <div class="card-body">
+                <div class="h6 text-success">Unique Players</div>
+                <div class="display-6 fw-bold">
+                    {{ "{:,}".format(summary.players_30d) }}
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3 mb-2">
+        <div class="card border-warning">
+            <div class="card-body">
+                <div class="h6 text-warning">Playtime (30d)</div>
+                <div class="display-6 fw-bold">
+                    {{ (summary.playtime_30d / 3600)|round|int }}h
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3 mb-2">
+        <div class="card border-secondary">
+            <div class="card-body">
+                <div class="h6 text-secondary">Active Servers</div>
+                <div class="display-6 fw-bold">
+                    {{ servers | selectattr("player_count", ">", 0) | list | length }}
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- POPULARITY HISTORY -->
+<div class="card bg-dark border-secondary mb-4">
+    <div class="card-header border-secondary">
+        📈 Faction Popularity Over Time
+    </div>
+    <div class="card-body">
+        <div style="height: 300px;">
+            <canvas id="factionHistoryChart"></canvas>
+        </div>
+    </div>
+</div>
+
+<!-- SERVER LIST -->
+<div class="row g-4">
+
+    <!-- SERVER LIST -->
+    <div class="col-lg-8">
+        <div class="card bg-dark border-secondary h-100">
+            <div class="card-header border-secondary">
+                🖥️ Servers Operated by {{ faction }}
+            </div>
+            <div class="table-responsive">
+                <table class="table table-dark table-striped table-hover mb-0">
+                    <thead class="text-secondary small text-uppercase">
+                        <tr>
+                            <th class="ps-4">Server</th>
+                            <th>Address</th>
+                            <th class="text-center">Players</th>
+                            <th>Location</th>
+                            <th class="text-end pe-4">Last Seen</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for s in servers %}
+                        <tr>
+                            <td class="ps-4">
+                                <a href="/server/{{ s.id }}" class="text-info fw-bold">
+                                    {{ s.name }}
+                                </a>
+                            </td>
+                            <td class="font-monospace small">{{ s.address }}</td>
+                            <td class="text-center">
+                                {% if s.player_count > 0 %}
+                                    <span class="text-success fw-bold">{{ s.player_count }}</span>
+                                {% else %}
+                                    <span class="text-muted">0</span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                <span class="fi fi-{{ s.flag }}"></span>
+                                {{ s.city }}
+                            </td>
+                            <td class="text-end pe-4 small text-muted">
+                                <span class="local-time" data-time="{{ s.last_seen }}">
+                                    {{ s.last_seen }}
+                                </span>
+                            </td>
+                        </tr>
+                        {% else %}
+                        <tr>
+                            <td colspan="5" class="text-center text-muted py-4">
+                                No servers found for this faction.
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- FACTION REGULARS -->
+    <div class="col-lg-4">
+        <div class="card bg-dark border-secondary h-100">
+            <div class="card-header border-secondary">
+                🧭 Faction Regulars (Top 50)
+            </div>
+            <div class="table-responsive">
+                <table class="table table-dark table-sm table-hover mb-0">
+                    <thead class="text-secondary small text-uppercase">
+                        <tr>
+                            <th>Player</th>
+                            <th class="text-end">Playtime</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for p in regulars %}
+                        <tr>
+                            <td>
+                                <a href="/player/{{ p.player_id }}" class="text-info">
+                                    {{ p.player_name }}
+                                </a>
+                            </td>
+                            <td class="text-end text-muted">
+                                {{ (p.total_playtime_seconds / 3600) | round(1) }}h
+                            </td>
+                        </tr>
+                        {% else %}
+                        <tr>
+                            <td colspan="2" class="text-center text-muted py-3">
+                                No data available.
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+
+    const ctx = document.getElementById("factionHistoryChart");
+    if (!ctx) return;
+
+    new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: {{ history.labels | tojson }},
+            datasets: [
+                {
+                    label: 'Unique Players',
+                    data: {{ history.players | tojson }},
+                    borderColor: '#0dcaf0',
+                    backgroundColor: 'rgba(13, 202, 240, 0.2)',
+                    tension: 0.25,
+                    yAxisID: 'y'
+                },
+                {
+                    label: 'Active Servers',
+                    data: {{ history.servers | tojson }},
+                    borderColor: '#198754',
+                    backgroundColor: 'rgba(25, 135, 84, 0.15)',
+                    tension: 0.25,
+                    yAxisID: 'y1'
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: {
+                mode: 'index',
+                intersect: false
+            },
+            scales: {
+                x: {
+                    ticks: { color: '#ccc' },
+                    grid: { color: '#333' }
+                },
+                y: {
+                    position: 'left',
+                    ticks: { color: '#0dcaf0' },
+                    grid: { color: '#333' }
+                },
+                y1: {
+                    position: 'right',
+                    ticks: { color: '#198754' },
+                    grid: { drawOnChartArea: false }
+                }
+            }
+        }
+    });
+});
+</script>
+{% endblock %}

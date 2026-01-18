@@ -10,7 +10,7 @@ import ipaddress # <--- Added for IP Math
 from datetime import datetime, timedelta
 
 # --- Configuration ---
-STEAM_KEY = ""
+STEAM_KEY = "xxxx"
 APP_ID = 232090
 API_URL = f"https://api.steampowered.com/IGameServersService/GetServerList/v1/?key={STEAM_KEY}&limit=50000&filter=\\appid\\{APP_ID}"
 DB_FILE = r"C:\apps\Webapp\kf2_panopticon_v3_star.db"
@@ -27,7 +27,9 @@ TIMEOUT = 3.0
 PRUNE_THRESHOLD = 6
 
 # --- Fix for Python 3.12+ Datetime warnings ---
-def adapt_date_iso(val): return val.isoformat(sep=' ')
+def adapt_date_iso(val):
+    return val.replace(microsecond=0).strftime('%Y-%m-%d %H:%M:%S')
+
 sqlite3.register_adapter(datetime, adapt_date_iso)
 # -----------------------------------------------
 
@@ -174,189 +176,303 @@ def clean_server_name(raw_name, ip_address):
     return name.title()
 
 def resolve_geo_db(conn, ip_str):
-    """Resolves IP to City, Code using DB ip_ranges."""
+    """Resolves IP to City, Code using DB ip_ranges. Verifies IP is within the range."""
     try:
         ip_int = int(ipaddress.IPv4Address(ip_str))
+        # We still search by ip_to for the index seek speed, but we select ip_from to verify.
         cur = conn.execute("""
-            SELECT city_name, country_code
+            SELECT city_name, country_code, ip_from
             FROM ip_ranges 
             WHERE ip_to >= ? 
             ORDER BY ip_to ASC 
             LIMIT 1
         """, (ip_int,))
         row = cur.fetchone()
-        if row and row[0] and row[1]:
-            return f"{row[0]}, {row[1]}"
-        elif row and row[1]:
-             return row[1]
-    except:
+        
+        # CRITICAL CHECK: Ensure the IP is actually inside the range
+        if row:
+            range_from = row[2]
+            if ip_int < range_from:
+                return "Unknown" # It fell into a gap before this range
+            
+            # If we are here, ip_from <= ip_int <= ip_to
+            if row[0] and row[1]:
+                return f"{row[0]}, {row[1]}"
+            elif row[1]:
+                return row[1]
+                
+    except Exception as e:
+        print(f"[!] Geo Error: {e}") # helpful to see if the DB lock is biting you
         pass
     return "Unknown"
     
 def init_db():
     with sqlite3.connect(DB_FILE) as conn:
-        conn.execute("PRAGMA foreign_keys = ON;")
-        
-        # 1. SERVERS (Updated with operator_name AND location)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS dim_servers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ip_address TEXT NOT NULL,
-                query_port INTEGER NOT NULL,
-                game_port INTEGER,
-                name TEXT,
-                current_map_id INTEGER,
-                player_count INTEGER DEFAULT 0,
-                map_start DATETIME,
-                last_seen DATETIME,
-                current_session_uuid TEXT,
-                operator_name TEXT,
-                location TEXT,  -- <--- Added Column
-                UNIQUE(ip_address, query_port)
-            )
+        cur = conn.cursor()
+
+        # -------------------------
+        # DIMENSION TABLES
+        # -------------------------
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS dim_maps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL
+        )
         """)
 
-        # 2. MAPS
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS dim_maps (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE NOT NULL
-            )
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS dim_players (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            real_name TEXT
+        )
         """)
 
-        # 3. PLAYERS
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS dim_players (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE NOT NULL
-            )
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS dim_servers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ip_address TEXT NOT NULL,
+            query_port INTEGER NOT NULL,
+            game_port INTEGER,
+            name TEXT,
+            current_map_id INTEGER,
+            player_count INTEGER DEFAULT 0,
+            map_start DATETIME,
+            last_seen DATETIME,
+            current_session_uuid TEXT,
+            operator_name TEXT,
+            location TEXT,
+            frozen_since DATETIME,
+            ingest_disabled INTEGER DEFAULT 0,
+            UNIQUE(ip_address, query_port)
+        )
         """)
 
-        # 4. SERVER HISTORY (Updated with calculated_duration)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS fact_server_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                server_id INTEGER,
-                map_id INTEGER,
-                session_start DATETIME,
-                session_end DATETIME,
-                reason TEXT,
-                session_uuid TEXT,
-                calculated_duration INTEGER DEFAULT 0, -- <--- Added Column
-                FOREIGN KEY (server_id) REFERENCES dim_servers(id),
-                FOREIGN KEY (map_id) REFERENCES dim_maps(id)
-            )
+        # -------------------------
+        # FACT TABLES
+        # -------------------------
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS fact_active (
+            server_id INTEGER,
+            player_id INTEGER,
+            map_id INTEGER,
+            score INTEGER,
+            duration REAL,
+            first_seen DATETIME,
+            last_seen DATETIME,
+            session_uuid TEXT,
+            calculated_duration REAL DEFAULT 0,
+            last_score_change DATETIME,
+            PRIMARY KEY (server_id, player_id)
+        )
         """)
 
-        # 5. ACTIVE SESSIONS (Updated with calculated_duration)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS fact_active (
-                server_id INTEGER,
-                player_id INTEGER,
-                map_id INTEGER,
-                score INTEGER,
-                duration REAL,
-                calculated_duration INTEGER DEFAULT 0, -- <--- Added Column
-                first_seen DATETIME,
-                last_seen DATETIME,
-                session_uuid TEXT,
-                PRIMARY KEY (server_id, player_id),
-                FOREIGN KEY (server_id) REFERENCES dim_servers(id),
-                FOREIGN KEY (player_id) REFERENCES dim_players(id),
-                FOREIGN KEY (map_id) REFERENCES dim_maps(id)
-            )
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS fact_global_stats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scan_time DATETIME,
+            active_servers INTEGER,
+            active_players INTEGER
+        )
         """)
 
-        # 6. SESSION HISTORY (Updated with calculated_duration)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS fact_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                server_id INTEGER,
-                player_id INTEGER,
-                map_id INTEGER,
-                final_score INTEGER,
-                total_time REAL,
-                session_start DATETIME,
-                session_end DATETIME,
-                session_uuid TEXT,
-                calculated_duration INTEGER DEFAULT 0, -- <--- Added Column
-                FOREIGN KEY (server_id) REFERENCES dim_servers(id),
-                FOREIGN KEY (player_id) REFERENCES dim_players(id)
-            )
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS fact_history (
+            id INTEGER,
+            server_id INTEGER,
+            player_id INTEGER,
+            map_id INTEGER,
+            final_score INTEGER,
+            total_time REAL,
+            session_start NUM,
+            session_end NUM,
+            session_uuid TEXT,
+            calculated_duration INTEGER
+        )
         """)
 
-        # 7. GLOBAL STATS
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS fact_global_stats (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                scan_time DATETIME,
-                active_servers INTEGER,
-                active_players INTEGER
-            )
-        """)
-        # --- ROLLUPS / MATERIALIZED STATS ---
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS meta_kv (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS fact_server_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            server_id INTEGER,
+            map_id INTEGER,
+            session_start DATETIME,
+            session_end DATETIME,
+            reason TEXT,
+            session_uuid TEXT,
+            calculated_duration INTEGER DEFAULT 0
+        )
         """)
 
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS fact_operator_daily (
-                day DATE,
-                operator_name TEXT,
-                server_count INTEGER NOT NULL,
-                unique_players INTEGER NOT NULL,
-                total_playtime_seconds INTEGER NOT NULL,
-                last_contact DATETIME,
-                PRIMARY KEY (day, operator_name)
-            )
-        """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_operator_daily_day ON fact_operator_daily(day)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_operator_daily_operator ON fact_operator_daily(operator_name)")
+        # -------------------------
+        # ROLLUP TABLES
+        # -------------------------
 
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS fact_map_daily (
-                day DATE,
-                map_id INTEGER,
-                session_count INTEGER NOT NULL,
-                total_seconds INTEGER NOT NULL,
-                PRIMARY KEY (day, map_id)
-            )
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS fact_map_daily (
+            day DATE,
+            map_id INTEGER,
+            session_count INTEGER NOT NULL,
+            total_seconds INTEGER NOT NULL,
+            PRIMARY KEY (day, map_id)
+        )
         """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_map_daily_day ON fact_map_daily(day)")
 
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS fact_server_daily (
-                day DATE,
-                server_id INTEGER,
-                session_count INTEGER NOT NULL,
-                total_seconds INTEGER NOT NULL,
-                PRIMARY KEY (day, server_id)
-            )
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS fact_operator_daily (
+            day DATE,
+            operator_name TEXT,
+            server_count INTEGER NOT NULL,
+            unique_players INTEGER NOT NULL,
+            total_playtime_seconds INTEGER NOT NULL,
+            last_contact DATETIME,
+            PRIMARY KEY (day, operator_name)
+        )
         """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_server_daily_day ON fact_server_daily(day)")
 
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS fact_player_daily (
-                day DATE,
-                player_id INTEGER,
-                session_count INTEGER NOT NULL,
-                total_seconds INTEGER NOT NULL,
-                PRIMARY KEY (day, player_id)
-            )
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS fact_operator_player_daily (
+            day DATE NOT NULL,
+            operator_name TEXT NOT NULL,
+            player_id INTEGER NOT NULL,
+            PRIMARY KEY (day, operator_name, player_id)
+        )
         """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_player_daily_day ON fact_player_daily(day)")
 
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS fact_traffic_daily (
-                day DATE PRIMARY KEY,
-                unique_players INTEGER NOT NULL
-            )
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS fact_player_daily (
+            day DATE,
+            player_id INTEGER,
+            session_count INTEGER NOT NULL,
+            total_seconds INTEGER NOT NULL,
+            PRIMARY KEY (day, player_id)
+        )
         """)
-        
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS fact_server_daily (
+            day DATE,
+            server_id INTEGER,
+            session_count INTEGER NOT NULL,
+            total_seconds INTEGER NOT NULL,
+            PRIMARY KEY (day, server_id)
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS fact_traffic_daily (
+            day DATE PRIMARY KEY,
+            unique_players INTEGER NOT NULL
+        )
+        """)
+
+        # -------------------------
+        # GEO / META TABLES
+        # -------------------------
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS ip_ranges (
+            ip_from INTEGER,
+            ip_to INTEGER,
+            country_code TEXT,
+            country_name TEXT,
+            region_name TEXT,
+            city_name TEXT
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS ipaddress (
+            ipaddress TEXT,
+            reserved TEXT,
+            continentcode TEXT,
+            continentname TEXT,
+            contrycode TEXT,
+            countryname TEXT,
+            statecode TEXT,
+            statename TEXT,
+            city TEXT,
+            postalcode TEXT,
+            isp TEXT,
+            asn INTEGER
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS meta_kv (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """)
+
+        # -------------------------
+        # VISIBILITY TABLES
+        # -------------------------
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS player_visibility (
+            player_id INTEGER PRIMARY KEY,
+            hidden INTEGER NOT NULL DEFAULT 1,
+            reason TEXT,
+            added_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS server_visibility (
+            server_id INTEGER PRIMARY KEY,
+            hidden INTEGER NOT NULL DEFAULT 1,
+            reason TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+
+        # -------------------------
+        # INDICES (VERBATIM)
+        # -------------------------
+
+        indices = [
+            "CREATE INDEX IF NOT EXISTS idx_active_last_seen ON fact_active(last_seen)",
+            "CREATE INDEX IF NOT EXISTS idx_active_server_score ON fact_active(server_id, score DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_dim_players_name ON dim_players(name)",
+            "CREATE INDEX IF NOT EXISTS idx_dim_servers_last_seen ON dim_servers(last_seen)",
+            "CREATE INDEX IF NOT EXISTS idx_dim_servers_name ON dim_servers(name)",
+            "CREATE INDEX IF NOT EXISTS idx_dim_servers_operator_id ON dim_servers(operator_name, id)",
+            "CREATE INDEX IF NOT EXISTS idx_dim_servers_operator_players ON dim_servers(operator_name, player_count)",
+            "CREATE INDEX IF NOT EXISTS idx_dim_servers_player_count ON dim_servers(player_count)",
+            "CREATE INDEX IF NOT EXISTS idx_fact_global_stats_time ON fact_global_stats(scan_time)",
+            "CREATE INDEX IF NOT EXISTS idx_fact_history_operator_player ON fact_history(server_id, player_id, calculated_duration)",
+            "CREATE INDEX IF NOT EXISTS idx_fact_history_player_duration ON fact_history(player_id, calculated_duration)",
+            "CREATE INDEX IF NOT EXISTS idx_fact_history_player_time ON fact_history(player_id, session_start DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_fact_history_server_player ON fact_history(server_id, player_id)",
+            "CREATE INDEX IF NOT EXISTS idx_fact_history_server_time ON fact_history(server_id, session_start DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_fact_history_session_player ON fact_history(session_uuid, player_id)",
+            "CREATE INDEX IF NOT EXISTS idx_fact_history_session_uuid ON fact_history(session_uuid)",
+            "CREATE INDEX IF NOT EXISTS idx_fact_map_daily_map_day ON fact_map_daily(map_id, day)",
+            "CREATE INDEX IF NOT EXISTS idx_fact_operator_daily_day_operator ON fact_operator_daily(day, operator_name)",
+            "CREATE INDEX IF NOT EXISTS idx_fact_operator_daily_operator_day ON fact_operator_daily(operator_name, day)",
+            "CREATE INDEX IF NOT EXISTS idx_fact_operator_player_daily_day_operator_player ON fact_operator_player_daily(day, operator_name, player_id)",
+            "CREATE INDEX IF NOT EXISTS idx_fact_operator_player_daily_operator_day ON fact_operator_player_daily(operator_name, day)",
+            "CREATE INDEX IF NOT EXISTS idx_fact_operator_player_daily_operator_player ON fact_operator_player_daily(operator_name, player_id)",
+            "CREATE INDEX IF NOT EXISTS idx_fact_player_daily_day_player ON fact_player_daily(day, player_id)",
+            "CREATE INDEX IF NOT EXISTS idx_fact_player_daily_player_day ON fact_player_daily(player_id, day)",
+            "CREATE INDEX IF NOT EXISTS idx_fact_server_daily_server_day ON fact_server_daily(server_id, day)",
+            "CREATE INDEX IF NOT EXISTS idx_fact_traffic_daily_day ON fact_traffic_daily(day)",
+            "CREATE INDEX IF NOT EXISTS idx_ip_ranges_to ON ip_ranges(ip_to)",
+            "CREATE INDEX IF NOT EXISTS idx_server_operator ON dim_servers(operator_name)",
+            "CREATE INDEX IF NOT EXISTS idx_server_visibility_server_hidden ON server_visibility(server_id, hidden)",
+            "CREATE INDEX IF NOT EXISTS idx_player_visibility_player ON player_visibility(player_id, hidden)",
+            "CREATE INDEX IF NOT EXISTS idx_srv_hist_server ON fact_server_history(server_id)",
+            "CREATE INDEX IF NOT EXISTS idx_srvhist_server_range ON fact_server_history(server_id, session_start, session_end)"
+        ]
+
+        for stmt in indices:
+            cur.execute(stmt)
+
         conn.commit()
+
 
 # --- Parsing ---
 def read_string(data, pos):
@@ -368,9 +484,13 @@ def read_string(data, pos):
 
 def parse_iso_time(time_str):
     try:
-        if not time_str: return datetime.utcnow() # <--- CHANGED: .now() to .utcnow()
-        return datetime.fromisoformat(time_str)
-    except ValueError: return datetime.utcnow()   # <--- CHANGED: .now() to .utcnow()
+        if not time_str:
+            return datetime.utcnow().replace(microsecond=0)
+        dt = datetime.fromisoformat(time_str.replace('+00:00', ''))
+        return dt.replace(microsecond=0)
+    except ValueError:
+        return datetime.utcnow().replace(microsecond=0)
+
 
 def get_public_ip():
     try:
@@ -456,11 +576,12 @@ def query_server(server_addr):
                     if not clean:
                         clean = f"[UNNAMED:{ip}:{query_port}:{slot}]"
                     
-                    results["player_list"].append({"name":clean,"score":score,"dur":dur})
+                    results["player_list"].append({"name":clean,"score":score,"dur":int(round(dur))})
                     slot += 1
         except: pass
         
     return results if results["name"] else None
+    
 def _kv_get(conn, key):
     row = conn.execute("SELECT value FROM meta_kv WHERE key = ?", (key,)).fetchone()
     return row[0] if row else None
@@ -470,6 +591,85 @@ def _kv_set(conn, key, value):
         INSERT INTO meta_kv (key, value) VALUES (?, ?)
         ON CONFLICT(key) DO UPDATE SET value=excluded.value
     """, (key, value))
+    
+def is_server_frozen(conn, server_id, scan_time, current_player_count, current_map_id):
+    """
+    Determines if a server is frozen OR should remain frozen.
+    
+    Logic:
+    1. ALGORITHM: Checks if 'Established' players are stalled (New Player Dilution Fix).
+    2. LATCH: If it was ALREADY frozen, it stays frozen until the map changes or it empties.
+    """
+
+    # 1. Immediate Pass: If empty, it cannot be frozen (or has implicitly recovered)
+    if current_player_count <= 0:
+        return False
+
+    # 2. Get Metrics + Previous State in one query
+    row = conn.execute("""
+        WITH metrics AS (
+            SELECT 
+                -- Count players connected > 15 mins
+                SUM(CASE WHEN (strftime('%s', ?) - strftime('%s', first_seen)) > 900 THEN 1 ELSE 0 END) as established_count,
+                
+                -- Count established players whose score hasn't changed in > 15 mins
+                SUM(CASE 
+                    WHEN (strftime('%s', ?) - strftime('%s', first_seen)) > 900 
+                    AND (strftime('%s', ?) - strftime('%s', last_score_change)) > 900 
+                    THEN 1 ELSE 0 
+                END) as stalled_established_count
+            FROM fact_active
+            WHERE server_id = ?
+        )
+        SELECT
+            -- [0] Algorithm Verdict
+            CASE
+                WHEN (strftime('%s', ?) - strftime('%s', s.map_start)) > 1800 -- Map > 30m
+                 AND m.established_count > 0                                  -- Has Vets
+                 AND m.stalled_established_count = m.established_count        -- Vets are stuck
+                THEN 1
+                ELSE 0
+            END as algo_frozen,
+            
+            -- [1] Latch State
+            s.ingest_disabled,
+            
+            -- [2] Stored Map ID
+            s.current_map_id
+            
+        FROM dim_servers s
+        JOIN metrics m ON 1=1
+        WHERE s.id = ?
+    """, (
+        scan_time, scan_time, scan_time, server_id, # CTE params
+        scan_time, server_id                        # Select params
+    )).fetchone()
+
+    if not row: return False
+
+    algo_says_frozen = bool(row[0])
+    was_frozen = bool(row[1])
+    db_map_id = row[2]
+
+    # --- DECISION LOGIC ---
+
+    # A. If the algorithm detects a freeze right now, it is frozen.
+    if algo_says_frozen:
+        return True
+
+    # B. The Safety Latch
+    # If the algo says "Healthy" (maybe a new player joined), 
+    # BUT we were previously frozen... check if we truly recovered.
+    if was_frozen:
+        # If the map hasn't changed, the server physically hasn't reset.
+        # We ignore the algo's false hope and keep the lock engaged.
+        if current_map_id == db_map_id:
+            return True 
+    
+    # C. Otherwise (Algo says healthy AND (Not previously frozen OR Map Rotated))
+    return False
+
+
 
 def backfill_rollups(conn):
     """
@@ -551,7 +751,20 @@ def backfill_rollups(conn):
         WHERE h.player_id IS NOT NULL
         GROUP BY day
     """)
-
+    # --- Operator player daily (for fast unique counts) ---
+    conn.execute("DELETE FROM fact_operator_player_daily")
+    conn.execute("""
+        INSERT INTO fact_operator_player_daily (day, operator_name, player_id)
+        SELECT DISTINCT
+            date(h.session_start) AS day,
+            s.operator_name,
+            h.player_id
+        FROM fact_history h
+        JOIN dim_servers s ON h.server_id = s.id
+        WHERE s.operator_name IS NOT NULL
+          AND s.operator_name != 'Unknown'
+          AND h.player_id IS NOT NULL
+    """)
     _kv_set(conn, "rollups_backfilled", "1")
 
 def refresh_recent_rollups(conn, scan_time, days_back=1):
@@ -559,6 +772,17 @@ def refresh_recent_rollups(conn, scan_time, days_back=1):
     Recompute rollups for today and the previous day (default),
     because new history rows only arrive for recent timestamps.
     """
+    # 1. DEBOUNCE CHECK
+    # We store the last run time in meta_kv to avoid running this heavy calc every 3 minutes.
+    last_run_str = _kv_get(conn, "last_rollup_time")
+    if last_run_str:
+        last_run = datetime.strptime(last_run_str, '%Y-%m-%d %H:%M:%S')
+        # If it hasn't been 30 minutes yet, skip the rollup
+        if (scan_time - last_run).total_seconds() < 1800: # 1800 seconds = 30 mins
+            return
+
+    print("[*] Performing Scheduled Stat Rollups (Debounce Cleared)...")
+	
     # We refresh for [today - days_back, today]
     # Example days_back=1 -> yesterday + today
     start_day = (scan_time - timedelta(days=days_back)).strftime("%Y-%m-%d")
@@ -640,11 +864,116 @@ def refresh_recent_rollups(conn, scan_time, days_back=1):
           AND h.player_id IS NOT NULL
         GROUP BY day
     """, (start_day, end_day))
+    # --- Operator player daily ---
+    conn.execute("""
+        DELETE FROM fact_operator_player_daily
+        WHERE day BETWEEN ? AND ?
+    """, (start_day, end_day))
 
+    conn.execute("""
+        INSERT INTO fact_operator_player_daily (day, operator_name, player_id)
+        SELECT DISTINCT
+            date(h.session_start),
+            s.operator_name,
+            h.player_id
+        FROM fact_history h
+        JOIN dim_servers s ON h.server_id = s.id
+        WHERE date(h.session_start) BETWEEN ? AND ?
+          AND s.operator_name IS NOT NULL
+          AND s.operator_name != 'Unknown'
+          AND h.player_id IS NOT NULL
+    """, (start_day, end_day))
+    _kv_set(conn, "last_rollup_time", scan_time.strftime('%Y-%m-%d %H:%M:%S'))
+
+def get_map_id(conn, map_cache, m_name):
+    if m_name in map_cache:
+        return map_cache[m_name]
+
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO dim_maps (name) VALUES (?)",
+        (m_name,)
+    )
+
+    mid = (
+        cur.lastrowid
+        or conn.execute(
+            "SELECT id FROM dim_maps WHERE name = ?",
+            (m_name,)
+        ).fetchone()[0]
+    )
+
+    map_cache[m_name] = mid
+    return mid
+
+
+def get_player_id(conn, player_cache, p_name):
+    # Fast path: already cached
+    if p_name in player_cache:
+        return player_cache[p_name]
+
+    # Insert or fetch by name (authoritative)
+    conn.execute("""
+        INSERT OR IGNORE INTO dim_players (name, real_name)
+        VALUES (?, ?)
+    """, (p_name, p_name))
+
+    pid = conn.execute(
+        "SELECT id FROM dim_players WHERE name = ?",
+        (p_name,)
+    ).fetchone()[0]
+
+    player_cache[p_name] = pid
+    return pid
+
+def get_server_targets():
+    """
+    Attempts to fetch the server list from the Steam Master Server.
+    If the API times out or fails, it falls back to the existing list 
+    of servers stored in the local database.
+    """
+    targets = []
+    
+    # --- STRATEGY 1: STEAM API ---
+    try:
+        print("[*] Contacting Steam Master Server...")
+        r = requests.get(API_URL, timeout=10) # 10s timeout
+        
+        if r.status_code == 200:
+            data = r.json()
+            servers = data.get("response", {}).get("servers", [])
+            targets = [s['addr'] for s in servers]
+            print(f"[*] Steam API: Acquired {len(targets)} targets.")
+            return targets
+        else:
+            print(f"[!] Steam API Error: Received Status Code {r.status_code}")
+            
+    except requests.exceptions.RequestException as e:
+        print(f"[!] Steam API Connection Failed: {e}")
+    except Exception as e:
+        print(f"[!] Steam API Parse Error: {e}")
+
+    # --- STRATEGY 2: DATABASE FALLBACK ---
+    # We only reach here if Strategy 1 failed or returned 0 servers
+    print("[*] Activating Local Database Fallback Protocol...")
+    
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            # Fetch every server we have ever seen
+            rows = conn.execute("SELECT ip_address, query_port FROM dim_servers").fetchall()
+            
+            # Reconstruct the "IP:PORT" string format expected by the scanner
+            targets = [f"{row[0]}:{row[1]}" for row in rows]
+            
+            print(f"[*] Local DB: Recovered {len(targets)} known targets from history.")
+            
+    except Exception as e:
+        print(f"[!] CRITICAL FAILURE: Could not read local DB for fallback: {e}")
+
+    return targets
 
 def main():
     start_time = time.time()
-    scan_time = datetime.utcnow() # <--- CHANGED: .now() to .utcnow()
+    scan_time = datetime.utcnow().replace(microsecond=0)
     print(f"--- [ SCAN STARTED: {scan_time.strftime('%H:%M:%S')} ] ---")
     
     init_db()
@@ -653,12 +982,11 @@ def main():
     if public_ip:
         print(f"[*] Identity Confirmed: {public_ip}")
 
-    try:
-        r = requests.get(API_URL, timeout=10)
-        addrs = [s['addr'] for s in r.json().get("response", {}).get("servers", [])]
-        print(f"[*] Targets Acquired: {len(addrs)}")
-    except Exception as e:
-        print(f"[!] Steam API Error: {e}")
+    # --- NEW: Get Targets with Fallback ---
+    addrs = get_server_targets()
+    
+    if not addrs:
+        print("[!] No targets acquired from API or DB. Aborting scan.")
         return
 
     valid_results = []
@@ -698,7 +1026,13 @@ def main():
         conn.execute("PRAGMA foreign_keys = ON;")
         
         map_cache = {row[1]: row[0] for row in conn.execute("SELECT id, name FROM dim_maps").fetchall()}
-        player_cache = {row[1]: row[0] for row in conn.execute("SELECT id, name FROM dim_players").fetchall()}
+        player_cache = {
+            row[1]: row[0]
+            for row in conn.execute(
+                "SELECT id, name FROM dim_players"
+            ).fetchall()
+        }
+
         
         server_cache = {}
         # New Cache Key Format: "IP:QueryPort"
@@ -717,19 +1051,6 @@ def main():
                 'operator_name': row[10]
             }
 
-        def get_map_id(m_name):
-            if m_name in map_cache: return map_cache[m_name]
-            cur = conn.execute("INSERT OR IGNORE INTO dim_maps (name) VALUES (?)", (m_name,))
-            mid = cur.lastrowid or conn.execute("SELECT id FROM dim_maps WHERE name = ?", (m_name,)).fetchone()[0]
-            map_cache[m_name] = mid
-            return mid
-
-        def get_player_id(p_name):
-            if p_name in player_cache: return player_cache[p_name]
-            cur = conn.execute("INSERT OR IGNORE INTO dim_players (name) VALUES (?)", (p_name,))
-            pid = cur.lastrowid or conn.execute("SELECT id FROM dim_players WHERE name = ?", (p_name,)).fetchone()[0]
-            player_cache[p_name] = pid
-            return pid
 
         prune_limit = (scan_time - timedelta(minutes=PRUNE_THRESHOLD)).strftime('%Y-%m-%d %H:%M:%S')
         
@@ -742,13 +1063,50 @@ def main():
         """, (prune_limit,))
         
         conn.execute("DELETE FROM fact_active WHERE last_seen < ?", (prune_limit,))
+        # --- ZOMBIE / SCORE-STAGNATION PRUNE ---
+        ZOMBIE_HOURS = 2
+        zombie_limit = (scan_time - timedelta(hours=ZOMBIE_HOURS)).strftime('%Y-%m-%d %H:%M:%S')
+
+        conn.execute("""
+            INSERT INTO fact_history (
+                server_id,
+                player_id,
+                map_id,
+                final_score,
+                total_time,
+                session_start,
+                session_end,
+                session_uuid,
+                calculated_duration
+            )
+            SELECT
+                server_id,
+                player_id,
+                map_id,
+                score,
+                duration,
+                first_seen,
+                last_seen,
+                session_uuid,
+                calculated_duration
+            FROM fact_active
+            WHERE last_score_change IS NOT NULL
+              AND last_score_change < ?
+        """, (zombie_limit,))
+
+        conn.execute("""
+            DELETE FROM fact_active
+            WHERE last_score_change IS NOT NULL
+              AND last_score_change < ?
+        """, (zombie_limit,))
         
         for s in valid_results:
             current_ip = s["addr"].split(':')[0]
             current_qport = s["query_port"]
             cache_key = f"{current_ip}:{current_qport}"
             
-            map_id = get_map_id(s["map"])
+            map_id = get_map_id(conn, map_cache, s["map"])
+
             
             # --- CALCULATE OPERATOR ---
             operator_name = clean_server_name(s["name"], current_ip)
@@ -850,51 +1208,120 @@ def main():
             final_game_port = s["game_port"] if s["game_port"] else db_game_port
             
             # Logic: Determine if we need a NEW session UUID
-            current_session_uuid = db_session_uuid            
+            current_session_uuid = db_session_uuid
             
-            # 4. Map Rotation History
-            if map_id != db_map_id:
-                # --- UPDATE: Calculate duration in Python for server history ---
-                duration_sec = int((scan_time - db_map_start).total_seconds())
-                
+            # 3.5 --- FREEZE DETECTION ---
+            # Pass 'map_id' (from current scan) to the function
+            frozen_now = is_server_frozen(conn, sid, scan_time, s["header_count"], map_id)
+            
+            if frozen_now:
+                # CONFIRMED FROZEN (Algorithm detected it OR Latch is holding it)
                 conn.execute("""
-                    INSERT INTO fact_server_history (server_id, map_id, session_start, session_end, reason, session_uuid, calculated_duration)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (sid, db_map_id, db_map_start, scan_time, "Map Rotation", db_session_uuid, duration_sec))
-                
-                db_map_start = scan_time
-                current_session_uuid = str(uuid.uuid4()) # New Match = New ID
-                
-            # --- [NEW] SECTION 4.5: MATCH RESTART DETECTION ---
-            # Logic: If map is the same, but scores dropped from "High" to "Near Zero", it's a wipe.
-            elif map_id == db_map_id:
-                # 1. Get the aggregate score from the PREVIOUS scan (DB State)
-                # We need to know what the score was before we overwrite it.
-                row = conn.execute("SELECT SUM(score) FROM fact_active WHERE server_id=?", (sid,)).fetchone()
-                prev_total_score = row[0] if row and row[0] else 0
-                
-                # 2. Calculate the aggregate score from the CURRENT scan (Live State)
-                curr_total_score = sum(p['score'] for p in s['player_list'])
+                    UPDATE dim_servers
+                    SET frozen_since = COALESCE(frozen_since, ?),
+                        ingest_disabled = 1
+                    WHERE id = ?
+                """, (scan_time, sid))
+            
+            else:
+                # CONFIRMED HEALTHY
+                # Check if we need to run a "Recovery" routine (clean up the mess)
+                row = conn.execute(
+                    "SELECT ingest_disabled FROM dim_servers WHERE id = ?", (sid,)
+                ).fetchone()
 
-                # 3. The "Wipe" Thresholds
-                # prev_total > 500: Ensures we don't log restarts for empty/idle servers.
-                # curr_total < 200: Allows for starting cash/points, but implies a hard reset.
-                if prev_total_score > 500 and curr_total_score < 200:
+                if row and row[0]:
+                    print(f"[*] Server {s['name']} recovered! Unfreezing.")
+                    # Server recovered -> force clean session
+                    current_session_uuid = str(uuid.uuid4())
+                    db_map_start = scan_time
+
+                    conn.execute("""
+                        UPDATE dim_servers
+                        SET frozen_since = NULL,
+                            ingest_disabled = 0,
+                            current_session_uuid = ?,
+                            map_start = ?
+                        WHERE id = ?
+                    """, (current_session_uuid, scan_time, sid))
+            # 4. Map Rotation History
+            if not frozen_now:
+                if map_id != db_map_id:
                     # --- UPDATE: Calculate duration in Python for server history ---
                     duration_sec = int((scan_time - db_map_start).total_seconds())
                     
                     conn.execute("""
                         INSERT INTO fact_server_history (server_id, map_id, session_start, session_end, reason, session_uuid, calculated_duration)
                         VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """, (sid, db_map_id, db_map_start, scan_time, "Match Restart", db_session_uuid, duration_sec))
+                    """, (sid, db_map_id, db_map_start, scan_time, "Map Rotation", db_session_uuid, duration_sec))
                     
-                    # CRITICAL: Reset the timer. 
-                    # If we don't do this, the next "session" will look like it lasted 4 hours 
-                    # instead of the 20 minutes it actually took them to fail.
                     db_map_start = scan_time
-                    current_session_uuid = str(uuid.uuid4()) # Restart = New ID
-            # --------------------------------------------------
-            
+                    current_session_uuid = str(uuid.uuid4()) # New Match = New ID
+                    
+                # --- [NEW] SECTION 4.5: MATCH RESTART DETECTION ---
+                # Logic: If map is the same, but scores dropped from "High" to "Near Zero", it's a wipe.
+                elif map_id == db_map_id:
+                    # 1. Get the aggregate score from the PREVIOUS scan (DB State)
+                    # We need to know what the score was before we overwrite it.
+                    row = conn.execute("SELECT SUM(score) FROM fact_active WHERE server_id=?", (sid,)).fetchone()
+                    prev_total_score = row[0] if row and row[0] else 0
+                    
+                    # 2. Calculate the aggregate score from the CURRENT scan (Live State)
+                    curr_total_score = sum(p['score'] for p in s['player_list'])
+
+                    # 3. The "Wipe" Thresholds
+                    # prev_total > 500: Ensures we don't log restarts for empty/idle servers.
+                    # curr_total < 200: Allows for starting cash/points, but implies a hard reset.
+                    if prev_total_score > 500 and curr_total_score < 200:
+                        # --- UPDATE: Calculate duration in Python for server history ---
+                        duration_sec = int((scan_time - db_map_start).total_seconds())
+                        
+                        conn.execute("""
+                            INSERT INTO fact_server_history (server_id, map_id, session_start, session_end, reason, session_uuid, calculated_duration)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """, (sid, db_map_id, db_map_start, scan_time, "Match Restart", db_session_uuid, duration_sec))
+                        
+                        # CRITICAL: Reset the timer. 
+                        # If we don't do this, the next "session" will look like it lasted 4 hours 
+                        # instead of the 20 minutes it actually took them to fail.
+                        db_map_start = scan_time
+                        current_session_uuid = str(uuid.uuid4()) # Restart = New ID
+                # --------------------------------------------------
+                
+            # SECTION 4.6
+            # 🔥 PLAYER SESSION FINALIZATION 🔥
+            if not frozen_now and current_session_uuid != db_session_uuid:
+                conn.execute("""
+                    INSERT INTO fact_history (
+                        server_id,
+                        player_id,
+                        map_id,
+                        final_score,
+                        total_time,
+                        session_start,
+                        session_end,
+                        session_uuid,
+                        calculated_duration
+                    )
+                    SELECT
+                        server_id,
+                        player_id,
+                        map_id,
+                        score,
+                        duration,
+                        first_seen,
+                        last_seen,
+                        session_uuid,
+                        calculated_duration
+                    FROM fact_active
+                    WHERE server_id=? AND session_uuid=?
+                """, (sid, db_session_uuid))
+            # 2. Remove them from active so they can be re-added cleanly
+                conn.execute("""
+                    DELETE FROM fact_active
+                    WHERE server_id=? AND session_uuid=?
+                """, (sid, db_session_uuid))     
+                
             # 5. Update Server State
             # Added operator_name=? and location=? to SET clause
             conn.execute("""
@@ -903,22 +1330,62 @@ def main():
                 WHERE id=?
             """, (s["name"], map_id, s["header_count"], db_map_start, scan_time, final_game_port, current_session_uuid, operator_name, location_val, sid)) 
             
-            # 6. Update Sessions
-            for p in s["player_list"]:
-                pid = get_player_id(p["name"])
-                
-                # --- UPDATE: Added calculated_duration math to fact_active ---
-                conn.execute("""
-                    INSERT INTO fact_active (server_id, player_id, map_id, score, duration, calculated_duration, first_seen, last_seen, session_uuid)
-                    VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
-                    ON CONFLICT(server_id, player_id) DO UPDATE SET
-                        score=excluded.score,
-                        duration=excluded.duration,
-                        calculated_duration=(strftime('%s', excluded.last_seen) - strftime('%s', fact_active.first_seen)),
-                        map_id=excluded.map_id,
-                        last_seen=excluded.last_seen,
-                        session_uuid=excluded.session_uuid
-                """, (sid, pid, map_id, p["score"], p["dur"], scan_time, scan_time, current_session_uuid))
+            if not current_session_uuid:
+                current_session_uuid = str(uuid.uuid4())
+            conn.execute("""
+                UPDATE dim_servers
+                SET current_session_uuid = ?
+                WHERE id = ?
+            """, (current_session_uuid, sid))    
+            # 6. Update Sessions (with score-stagnation tracking)
+            if not frozen_now:
+                for p in s["player_list"]:
+                    pid = get_player_id(conn, player_cache, p["name"])
+                    now_ts = scan_time
+                    conn.execute("""
+                        INSERT INTO fact_active (
+                            server_id,
+                            player_id,
+                            map_id,
+                            score,
+                            duration,
+                            calculated_duration,
+                            first_seen,
+                            last_seen,
+                            session_uuid,
+                            last_score_change
+                        )
+                        VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                        ON CONFLICT(server_id, player_id) DO UPDATE SET
+                            -- Initialize if NULL, update if score changes, otherwise preserve
+                            last_score_change = CASE
+                                WHEN fact_active.last_score_change IS NULL
+                                    THEN excluded.last_seen
+                                WHEN fact_active.score != excluded.score
+                                    THEN excluded.last_seen
+                                ELSE fact_active.last_score_change
+                            END,
+
+                            score = excluded.score,
+                            duration = excluded.duration,
+                            calculated_duration =
+                                (strftime('%s', excluded.last_seen) - strftime('%s', fact_active.first_seen)),
+                            map_id = excluded.map_id,
+                            last_seen = excluded.last_seen,
+                            session_uuid = excluded.session_uuid
+                    """, (
+                        sid,
+                        pid,
+                        map_id,
+                        p["score"],
+                        p["dur"],
+                        scan_time,
+                        scan_time,
+                        current_session_uuid,
+                        scan_time
+                    ))
+
+
 
         conn.execute("""
             INSERT INTO fact_global_stats (scan_time, active_servers, active_players)

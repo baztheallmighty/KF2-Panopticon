@@ -17,7 +17,7 @@
                         {% if server.operator_name and server.operator_name != 'Unknown' %}
                         <div class="mb-2">
                             <span class="badge bg-secondary">Faction</span>
-                            <a href="/?faction={{ server.operator_name|urlencode }}" class="text-info fw-bold text-decoration-none ms-1" title="View all servers by {{ server.operator_name }}">
+                            <a href="/faction/{{ server.operator_name|urlencode }}" class="text-info fw-bold text-decoration-none ms-1" title="View all servers by {{ server.operator_name }}">
                                 {{ server.operator_name }}
                             </a>
                         </div>
