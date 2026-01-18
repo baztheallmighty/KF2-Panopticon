@@ -1,6 +1,14 @@
 # KF2 Panopticon v1.0
 
 **KF2 Panopticon** is a data aggregation and analytics platform designed for *Killing Floor 2* game servers. This application queries the Steam Master Server API and individual game servers via the A2S protocol to collect real-time data on server status, player activity, and map rotation. It utilizes a SQLite database with a Star Schema design to store historical data and provides a web-based frontend for visualization and analysis.
+## Screenshots
+<img width="1816" height="1226" alt="image" src="https://github.com/user-attachments/assets/3453df8d-b298-46fa-b199-4adb6fa96cc4" />
+<img width="1834" height="1214" alt="image" src="https://github.com/user-attachments/assets/af8fa037-fa1b-4adf-b2c0-395b9816958e" />
+<img width="1796" height="1268" alt="image" src="https://github.com/user-attachments/assets/8230a604-6141-4036-a2d4-9f5750fcdccf" />
+<img width="1802" height="1265" alt="image" src="https://github.com/user-attachments/assets/b45821b2-d72d-4f1f-873d-e6e8a5a4425c" />
+<img width="1785" height="1212" alt="image" src="https://github.com/user-attachments/assets/8162ca17-ded0-4aca-99f1-f8c7b62ef569" />
+
+
 
 ## System Architecture
 
